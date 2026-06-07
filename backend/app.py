@@ -99,6 +99,130 @@ def reset_room(room_id):
     room.reset_database()
     return jsonify({'success': True, 'message': 'Room voiceprint database reset'})
 
+@app.route('/api/rooms/<room_id>/whitelist', methods=['GET'])
+def get_whitelist(room_id):
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    return jsonify({
+        'success': True,
+        'whitelist': room.get_whitelist(),
+        'whitelist_enabled': room.whitelist_enabled,
+        'host_user_id': room.host_user_id
+    })
+
+@app.route('/api/rooms/<room_id>/whitelist/add', methods=['POST'])
+def add_to_whitelist(room_id):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    requester_id = data.get('requester_id')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    
+    if not room.is_host(requester_id):
+        return jsonify({'success': False, 'error': 'Only host can manage whitelist'}), 403
+    
+    success = room.add_to_whitelist(user_id)
+    if success:
+        socketio.emit('whitelist_updated', {
+            'room_id': room_id,
+            'whitelist': room.get_whitelist(),
+            'whitelist_enabled': room.whitelist_enabled
+        }, room=room_id)
+    
+    return jsonify({
+        'success': success,
+        'whitelist': room.get_whitelist()
+    })
+
+@app.route('/api/rooms/<room_id>/whitelist/remove', methods=['POST'])
+def remove_from_whitelist(room_id):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    requester_id = data.get('requester_id')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    
+    if not room.is_host(requester_id):
+        return jsonify({'success': False, 'error': 'Only host can manage whitelist'}), 403
+    
+    success = room.remove_from_whitelist(user_id)
+    if success:
+        socketio.emit('whitelist_updated', {
+            'room_id': room_id,
+            'whitelist': room.get_whitelist(),
+            'whitelist_enabled': room.whitelist_enabled
+        }, room=room_id)
+    
+    return jsonify({
+        'success': success,
+        'whitelist': room.get_whitelist()
+    })
+
+@app.route('/api/rooms/<room_id>/whitelist/enable', methods=['POST'])
+def set_whitelist_enabled(room_id):
+    data = request.get_json()
+    enabled = data.get('enabled', True)
+    requester_id = data.get('requester_id')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    
+    if not room.is_host(requester_id):
+        return jsonify({'success': False, 'error': 'Only host can manage whitelist'}), 403
+    
+    room.set_whitelist_enabled(enabled)
+    
+    socketio.emit('whitelist_updated', {
+        'room_id': room_id,
+        'whitelist': room.get_whitelist(),
+        'whitelist_enabled': room.whitelist_enabled
+    }, room=room_id)
+    
+    return jsonify({
+        'success': True,
+        'whitelist_enabled': enabled,
+        'whitelist': room.get_whitelist()
+    })
+
+@app.route('/api/rooms/<room_id>/host', methods=['POST'])
+def set_host(room_id):
+    data = request.get_json()
+    user_id = data.get('user_id')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    
+    room.set_host(user_id)
+    
+    return jsonify({
+        'success': True,
+        'host_user_id': user_id
+    })
+
+@app.route('/api/rooms/<room_id>/history', methods=['GET'])
+def get_recognition_history(room_id):
+    start_time = request.args.get('start_time', type=float)
+    end_time = request.args.get('end_time', type=float)
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return jsonify({'success': False, 'error': 'Room not found'}), 404
+    
+    history = room.get_history(start_time, end_time)
+    
+    return jsonify({
+        'success': True,
+        'history': history,
+        'count': len(history)
+    })
+
 @socketio.on('join_call')
 def handle_join_call(data):
     room_id = data.get('room_id')
@@ -145,10 +269,10 @@ def handle_leave_call(data):
 def handle_voiceprint_feature(data):
     room_id = data.get('room_id')
     user_id = data.get('user_id')
-    mfcc_vector = data.get('mfcc')
     waveform = data.get('waveform', [])
+    delta_data = data.get('delta')
     
-    if not room_id or not mfcc_vector:
+    if not room_id or not delta_data:
         return
     
     room = room_manager.get_room(room_id)
@@ -156,28 +280,82 @@ def handle_voiceprint_feature(data):
         return
     
     try:
-        mfcc_array = np.array(mfcc_vector, dtype=np.float32)
+        identified_id, identified_name, similarity, is_whitelisted = room.identify_with_delta(
+            user_id, delta_data, threshold=0.5
+        )
+        all_matches = room.search_with_delta(user_id, delta_data, k=5)
         
-        identified_id, identified_name, similarity = room.identify_speaker(mfcc_array, threshold=0.5)
-        all_matches = room.search_similar(mfcc_array, k=5)
+        history_record = {
+            'timestamp': data.get('timestamp', 0),
+            'sender_id': user_id,
+            'identified_id': identified_id,
+            'identified_name': identified_name,
+            'similarity': similarity,
+            'is_whitelisted': is_whitelisted,
+            'all_matches': [
+                {'user_id': uid, 'user_name': uname, 'similarity': sim, 'is_whitelisted': wl}
+                for uid, uname, sim, wl in all_matches
+            ]
+        }
+        room.add_to_history(history_record)
         
         response = {
             'sender_id': user_id,
             'identified_id': identified_id,
             'identified_name': identified_name,
             'similarity': similarity,
+            'is_whitelisted': is_whitelisted,
+            'whitelist_enabled': room.whitelist_enabled,
             'all_matches': [
-                {'user_id': uid, 'user_name': uname, 'similarity': sim}
-                for uid, uname, sim in all_matches
+                {'user_id': uid, 'user_name': uname, 'similarity': sim, 'is_whitelisted': wl}
+                for uid, uname, sim, wl in all_matches
             ],
             'waveform': waveform[:100] if waveform else [],
-            'timestamp': data.get('timestamp', 0)
+            'timestamp': data.get('timestamp', 0),
+            'is_delta': delta_data.get('is_delta', True),
+            'is_keyframe': delta_data.get('is_keyframe', False)
         }
         
         emit('speaker_identified', response, room=room_id)
     
     except Exception as e:
         print(f"Error processing voiceprint: {e}")
+
+@socketio.on('request_history')
+def handle_request_history(data):
+    room_id = data.get('room_id')
+    start_time = data.get('start_time')
+    end_time = data.get('end_time')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return
+    
+    history = room.get_history(start_time, end_time)
+    emit('history_data', {
+        'room_id': room_id,
+        'history': history,
+        'start_time': start_time,
+        'end_time': end_time
+    })
+
+@socketio.on('seek_history')
+def handle_seek_history(data):
+    room_id = data.get('room_id')
+    timestamp = data.get('timestamp')
+    
+    room = room_manager.get_room(room_id)
+    if not room:
+        return
+    
+    history = room.get_history(timestamp - 1000, timestamp + 1000)
+    if history:
+        closest = min(history, key=lambda x: abs(x['timestamp'] - timestamp))
+        emit('seek_result', {
+            'room_id': room_id,
+            'timestamp': timestamp,
+            'record': closest
+        })
 
 @socketio.on('signal')
 def handle_signal(data):

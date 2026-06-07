@@ -17,9 +17,22 @@ export class MFCCExtractor {
         
         this.waveformData = new Float32Array(this.bufferSize);
         this.lastMFCC = new Float32Array(this.nMFCC);
+        this.lastSentMFCC = null;
+        this.keyframeInterval = 30;
+        this.frameCount = 0;
+        this.deltaThreshold = 0.01;
+        this.quantizationBits = 8;
         
         this.onMFCC = null;
+        this.onDelta = null;
         this.workletLoaded = false;
+        
+        this.stats = {
+            keyframes: 0,
+            deltas: 0,
+            totalBytes: 0,
+            uncompressedBytes: 0
+        };
     }
 
     async init(mediaStream) {
@@ -79,9 +92,94 @@ export class MFCCExtractor {
         const mfcc = this.computeMFCC(audioBuffer);
         this.lastMFCC = mfcc;
         
+        const deltaData = this.computeDelta(mfcc);
+        
         if (this.onMFCC) {
-            this.onMFCC(mfcc, waveform);
+            this.onMFCC(mfcc, waveform, deltaData);
         }
+        
+        if (this.onDelta) {
+            this.onDelta(deltaData, waveform);
+        }
+    }
+    
+    computeDelta(currentMFCC) {
+        this.frameCount++;
+        
+        const isKeyframe = this.lastSentMFCC === null || 
+                          this.frameCount % this.keyframeInterval === 0 ||
+                          this.checkSignificantChange(currentMFCC);
+        
+        let delta;
+        if (isKeyframe) {
+            delta = Array.from(currentMFCC);
+            this.stats.keyframes++;
+            this.stats.uncompressedBytes += currentMFCC.length * 4;
+            this.stats.totalBytes += currentMFCC.length * 4;
+        } else {
+            delta = new Array(currentMFCC.length);
+            for (let i = 0; i < currentMFCC.length; i++) {
+                delta[i] = this.quantize(currentMFCC[i] - this.lastSentMFCC[i]);
+            }
+            this.stats.deltas++;
+            this.stats.uncompressedBytes += currentMFCC.length * 4;
+            this.stats.totalBytes += this.estimateCompressedSize(delta);
+        }
+        
+        this.lastSentMFCC = new Float32Array(currentMFCC);
+        
+        return {
+            delta: delta,
+            is_keyframe: isKeyframe,
+            is_delta: !isKeyframe,
+            timestamp: Date.now()
+        };
+    }
+    
+    checkSignificantChange(currentMFCC) {
+        if (!this.lastSentMFCC) return true;
+        
+        let totalChange = 0;
+        for (let i = 0; i < currentMFCC.length; i++) {
+            totalChange += Math.abs(currentMFCC[i] - this.lastSentMFCC[i]);
+        }
+        const avgChange = totalChange / currentMFCC.length;
+        return avgChange > this.deltaThreshold * 10;
+    }
+    
+    quantize(value) {
+        const step = this.deltaThreshold;
+        return Math.round(value / step) * step;
+    }
+    
+    estimateCompressedSize(delta) {
+        let nonZeroCount = 0;
+        for (const v of delta) {
+            if (Math.abs(v) > 0) nonZeroCount++;
+        }
+        return nonZeroCount * 2 + 4;
+    }
+    
+    getStats() {
+        const compressionRatio = this.stats.uncompressedBytes > 0 
+            ? (1 - this.stats.totalBytes / this.stats.uncompressedBytes) * 100 
+            : 0;
+        return {
+            keyframes: this.stats.keyframes,
+            deltas: this.stats.deltas,
+            compressionRatio: compressionRatio.toFixed(1) + '%'
+        };
+    }
+    
+    resetStats() {
+        this.stats = {
+            keyframes: 0,
+            deltas: 0,
+            totalBytes: 0,
+            uncompressedBytes: 0
+        };
+        this.lastSentMFCC = null;
+        this.frameCount = 0;
     }
 
     computeMFCC(audioData) {
