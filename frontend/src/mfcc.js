@@ -3,7 +3,7 @@ export class MFCCExtractor {
         this.audioContext = null;
         this.sourceNode = null;
         this.analyserNode = null;
-        this.scriptProcessor = null;
+        this.workletNode = null;
         this.isRunning = false;
         this.bufferSize = 2048;
         this.sampleRate = 44100;
@@ -19,8 +19,7 @@ export class MFCCExtractor {
         this.lastMFCC = new Float32Array(this.nMFCC);
         
         this.onMFCC = null;
-        this.frameCount = 0;
-        this.sendInterval = 5;
+        this.workletLoaded = false;
     }
 
     async init(mediaStream) {
@@ -32,84 +31,71 @@ export class MFCCExtractor {
             await this.audioContext.resume();
         }
         
+        if (!this.workletLoaded) {
+            await this.audioContext.audioWorklet.addModule('/mfcc-processor.js');
+            this.workletLoaded = true;
+        }
+        
         this.sourceNode = this.audioContext.createMediaStreamSource(mediaStream);
         this.analyserNode = this.audioContext.createAnalyser();
         this.analyserNode.fftSize = this.bufferSize * 2;
         this.analyserNode.smoothingTimeConstant = 0.8;
         
-        this.scriptProcessor = this.audioContext.createScriptProcessor(
-            this.bufferSize,
-            1,
-            1
+        this.workletNode = new AudioWorkletNode(
+            this.audioContext,
+            'mfcc-processor',
+            {
+                processorOptions: {
+                    bufferSize: this.bufferSize,
+                    sendInterval: 5,
+                    silenceThreshold: 0.01
+                }
+            }
         );
         
         this.melFilterBank = this.createMelFilterBank();
         this.dctMatrix = this.createDCTMatrix();
         
-        this.sourceNode.connect(this.analyserNode);
-        this.analyserNode.connect(this.scriptProcessor);
-        this.scriptProcessor.connect(this.audioContext.destination);
-        
-        this.scriptProcessor.onaudioprocess = (event) => {
-            this.processAudio(event);
+        this.workletNode.port.onmessage = (event) => {
+            if (event.data.type === 'audioData') {
+                this.handleAudioData(event.data);
+            }
         };
+        
+        this.sourceNode.connect(this.analyserNode);
+        this.analyserNode.connect(this.workletNode);
         
         this.isRunning = true;
     }
 
-    processAudio(event) {
+    handleAudioData(data) {
         if (!this.isRunning) return;
         
-        const inputData = event.inputBuffer.getChannelData(0);
-        this.waveformData.set(inputData);
+        const audioBuffer = data.buffer;
+        const waveform = data.waveform;
         
-        const isSilent = this.checkSilence(inputData);
-        if (isSilent) return;
+        this.waveformData.set(audioBuffer);
         
-        this.frameCount++;
-        if (this.frameCount % this.sendInterval !== 0) return;
-        
-        const mfcc = this.computeMFCC(inputData);
+        const mfcc = this.computeMFCC(audioBuffer);
         this.lastMFCC = mfcc;
         
         if (this.onMFCC) {
-            const downsampledWaveform = this.downsampleWaveform(inputData, 100);
-            this.onMFCC(mfcc, downsampledWaveform);
+            this.onMFCC(mfcc, waveform);
         }
-    }
-
-    checkSilence(data, threshold = 0.01) {
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-            sum += Math.abs(data[i]);
-        }
-        const avg = sum / data.length;
-        return avg < threshold;
-    }
-
-    downsampleWaveform(data, targetLength) {
-        const step = data.length / targetLength;
-        const result = new Float32Array(targetLength);
-        
-        for (let i = 0; i < targetLength; i++) {
-            const start = Math.floor(i * step);
-            const end = Math.floor((i + 1) * step);
-            let sum = 0;
-            for (let j = start; j < end; j++) {
-                sum += data[j];
-            }
-            result[i] = sum / (end - start);
-        }
-        
-        return result;
     }
 
     computeMFCC(audioData) {
         const windowed = this.applyWindow(audioData);
         const spectrum = this.fft(windowed);
-        const powerSpectrum = spectrum.map(v => v * v / spectrum.length);
+        const powerSpectrum = new Float32Array(spectrum.length);
+        for (let i = 0; i < spectrum.length; i++) {
+            powerSpectrum[i] = spectrum[i] * spectrum[i] / spectrum.length;
+        }
         const melEnergies = this.applyMelFilterBank(powerSpectrum);
-        const logMel = melEnergies.map(e => Math.log(Math.max(e, 1e-10)));
+        const logMel = new Float32Array(melEnergies.length);
+        for (let i = 0; i < melEnergies.length; i++) {
+            logMel[i] = Math.log(Math.max(melEnergies[i], 1e-10));
+        }
         const mfcc = this.applyDCT(logMel);
         
         return mfcc.slice(0, this.nMFCC);
@@ -143,13 +129,17 @@ export class MFCCExtractor {
         
         for (let k = 0; k < n / 2; k++) {
             const angle = -2 * Math.PI * k / n;
-            const t = {
-                re: Math.cos(angle) * fftOdd[k] - Math.sin(angle) * fftOdd[k + n/2] || 0,
-                im: Math.sin(angle) * fftOdd[k] + Math.cos(angle) * fftOdd[k + n/2] || 0
-            };
+            const cosA = Math.cos(angle);
+            const sinA = Math.sin(angle);
             
-            result[k] = fftEven[k] + t.re;
-            result[k + n/2] = fftEven[k] - t.re;
+            const oddRe = fftOdd[k];
+            const oddIm = fftOdd[k + n/2] || 0;
+            
+            const tRe = cosA * oddRe - sinA * oddIm;
+            const tIm = sinA * oddRe + cosA * oddIm;
+            
+            result[k] = fftEven[k] + tRe;
+            result[k + n/2] = fftEven[k] - tRe;
         }
         
         const magnitudes = new Float32Array(n);
@@ -182,7 +172,7 @@ export class MFCCExtractor {
         
         const filterBank = [];
         for (let i = 0; i < this.nMelFilters; i++) {
-            const filter = new Array(nFFT / 2).fill(0);
+            const filter = new Float32Array(nFFT / 2);
             const left = melPoints[i];
             const mid = melPoints[i + 1];
             const right = melPoints[i + 2];
@@ -206,8 +196,9 @@ export class MFCCExtractor {
         
         for (let i = 0; i < this.nMelFilters; i++) {
             let energy = 0;
+            const filter = this.melFilterBank[i];
             for (let j = 0; j < halfLen; j++) {
-                energy += spectrum[j] * this.melFilterBank[i][j];
+                energy += spectrum[j] * filter[j];
             }
             energies[i] = energy;
         }
@@ -235,9 +226,10 @@ export class MFCCExtractor {
         for (let i = 0; i < this.nMFCC; i++) {
             let sum = 0;
             const ci = i === 0 ? Math.sqrt(1 / this.nMelFilters) : Math.sqrt(2 / this.nMelFilters);
+            const row = this.dctMatrix[i];
             
             for (let j = 0; j < this.nMelFilters; j++) {
-                sum += data[j] * this.dctMatrix[i][j];
+                sum += data[j] * row[j];
             }
             
             result[i] = ci * sum;
@@ -249,9 +241,10 @@ export class MFCCExtractor {
     stop() {
         this.isRunning = false;
         
-        if (this.scriptProcessor) {
-            this.scriptProcessor.disconnect();
-            this.scriptProcessor.onaudioprocess = null;
+        if (this.workletNode) {
+            this.workletNode.port.postMessage({ type: 'stop' });
+            this.workletNode.disconnect();
+            this.workletNode.port.onmessage = null;
         }
         
         if (this.analyserNode) {
@@ -269,6 +262,6 @@ export class MFCCExtractor {
         this.audioContext = null;
         this.sourceNode = null;
         this.analyserNode = null;
-        this.scriptProcessor = null;
+        this.workletNode = null;
     }
 }
